@@ -58,6 +58,18 @@ describe("databases written by earlier builds", () => {
     });
   });
 
+  it("opens the v4 workspace database as a normal asset and keeps v5 flow-only pay assets hidden", () => {
+    upgraded("org-v4.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ flow_only: number }>("SELECT flow_only FROM assets WHERE id = 'usd-mainnet'")).toEqual({ flow_only: 0 });
+    });
+    upgraded("org-v5.db", ORG_MIGRATIONS, (db) => {
+      const row = db.get<{ flow_only: number; instruction_window_hours: number }>(
+        "SELECT flow_only, instruction_window_hours FROM assets WHERE id = 'usd-mainnet'",
+      );
+      expect(row).toEqual({ flow_only: 1, instruction_window_hours: 48 });
+    });
+  });
+
   it("backfills sign-off history from the v1 notes when upgrading", () => {
     upgraded("org-v1.db", ORG_MIGRATIONS, (db) => {
       expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM break_note_history")?.n).toBe(0);

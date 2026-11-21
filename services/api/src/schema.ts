@@ -172,6 +172,10 @@ CREATE INDEX actions_due ON actions (record_time) WHERE snapshot IS NULL;
 ALTER TABLE assets ADD COLUMN instruction_window_hours INTEGER NOT NULL DEFAULT 72;
 ALTER TABLE assets ADD COLUMN movement_window_hours INTEGER NOT NULL DEFAULT 24;
 `,
+  // v5: hidden flow-only pay assets watched automatically for dividend actions.
+  `
+ALTER TABLE assets ADD COLUMN flow_only INTEGER NOT NULL DEFAULT 0;
+`,
 ];
 
 /** Identity: who may sign in, and which workspace each session is bound to. */

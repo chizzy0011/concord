@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
 import { Keypair, StrKey, nativeToScVal } from "@stellar/stellar-sdk";
@@ -1989,6 +1991,190 @@ describe("Concord", () => {
     expect(() => concord.exportCsv("FUND", "action", { id: 999999 })).toThrow(NotFound);
     expect(() => concord.exportCsv(other.id, "action", { id: action.id })).toThrow(Invalid);
     expect((await client.call(`/api/assets/${other.id}/export?section=action&id=${action.id}`)).status).toBe(400);
+  });
+
+  it("lists journalEntries with latest-run match status, pagination, instructionList, and CLI commands", async () => {
+    const h = harness();
+    const client = await new Client(h.app).signUp("lists@example.test", "List Books");
+    const issuer = key();
+    const holder = key();
+    const concord = h.tenants.forOrg(client.orgId);
+    const asset = await concord.watchAsset({ network: "testnet", asset: `FUND:${issuer}`, fromLedger: 1 });
+    h.chain.push(asset.id, "mint", 3, { to: holder, amount: u(100), txHash: "tx-match" });
+    await concord.sync(asset.id);
+
+    concord.importRegister(asset.id, {
+      csv: `holder_id,account,units\nH1,${holder},100\n`,
+      asOf: at(2),
+    });
+    await concord.reconcile(asset.id);
+
+    concord.importJournal(
+      asset.id,
+      `ref,date,type,from_account,to_account,units,tx_hash\nJ1,${at(3)},issue,,${holder},100,tx-match\nJ2,${at(4)},transfer,${holder},${key()},25,tx-miss\n`,
+    );
+    concord.importInstructions(
+      asset.id,
+      `ref,type,account,units,issued_at,approved_by,reason\nI1,freeze,${holder},, ${at(5)},alice,audit\n`.replace(", ", ","),
+    );
+
+    // Before movement reconciliation runs against the journal, status is null.
+    expect(concord.journalEntries("FUND")).toEqual([
+      {
+        ref: "J2",
+        date: at(4),
+        type: "transfer",
+        from: holder,
+        to: expect.any(String),
+        units: "25",
+        txHash: "tx-miss",
+        status: null,
+      },
+      {
+        ref: "J1",
+        date: at(3),
+        type: "issue",
+        from: null,
+        to: holder,
+        units: "100",
+        txHash: "tx-match",
+        status: null,
+      },
+    ]);
+
+    concord.importRegister(asset.id, {
+      csv: `holder_id,account,units\nH1,${holder},100\n`,
+      asOf: at(6),
+    });
+    await concord.reconcile(asset.id);
+
+    const listed = concord.journalEntries("FUND");
+    expect(listed.map((r) => [r.ref, r.status, r.units])).toEqual([
+      ["J2", "unmatched", "25"],
+      ["J1", "matched", "100"],
+    ]);
+    expect(concord.journalEntries("FUND", { limit: 1 })).toHaveLength(1);
+    expect(concord.journalEntries("FUND", { before: "J2" }).map((r) => r.ref)).toEqual(["J1"]);
+
+    expect(concord.instructionList("FUND")).toEqual([
+      {
+        ref: "I1",
+        type: "freeze",
+        account: holder,
+        units: null,
+        issuedAt: at(5),
+        approvedBy: "alice",
+        reason: "audit",
+      },
+    ]);
+
+    // Verify CLI commands against a disk-backed data directory.
+    const dir = mkdtempSync(join(tmpdir(), "concord-cli-543-"));
+    try {
+      const { openRuntime } = await import("../src/main.js");
+      const { loadConfig } = await import("../src/config.js");
+      const rt = openRuntime(loadConfig({ CONCORD_DATA_DIR: dir, CONCORD_SIGNUP: "open" }));
+      let orgId: string;
+      try {
+        const signed = await rt.auth.signUp({
+          email: "cli@example.test",
+          name: "CLI User",
+          orgName: "CLI Org",
+          password: "correct horse battery",
+        });
+        orgId = signed.orgId;
+        const ws = rt.tenants.forOrg(orgId);
+        // Seed an asset directly into sqlite so CLI does not touch network.
+        ws.db.insert(
+          `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, created_at)
+           VALUES ('CASSETCLI', 'testnet', 'FUND', ?, 'Fund', 7, 'window', 'ready', ?)`,
+          issuer,
+          at(1),
+        );
+        ws.importJournal("FUND", `ref,date,type,from_account,to_account,units,tx_hash\nJ-CLI,${at(3)},issue,,${holder},42.5,tx-cli\n`);
+        ws.importInstructions("FUND", `ref,type,account,units,issued_at\nI-CLI,clawback,${holder},5,${at(4)}\n`);
+      } finally {
+        rt.close();
+      }
+
+      const { runCli } = await import("../src/cli.js");
+      const execCli = async (args: string[]) => {
+        const lines: string[] = [];
+        const spy = vi.spyOn(console, "log").mockImplementation((msg?: unknown) => lines.push(String(msg ?? "")));
+        try {
+          await runCli(args, { CONCORD_DATA_DIR: dir, CONCORD_ORG: orgId });
+          return lines.join("\n");
+        } finally {
+          spy.mockRestore();
+        }
+      };
+
+      const jOut = JSON.parse(await execCli(["journal-list", "FUND", "--json"])) as Array<Record<string, unknown>>;
+      expect(jOut).toEqual([
+        {
+          ref: "J-CLI",
+          date: at(3),
+          type: "issue",
+          from: null,
+          to: holder,
+          units: "42.5",
+          txHash: "tx-cli",
+          status: null,
+        },
+      ]);
+
+      const iOut = JSON.parse(await execCli(["instructions-list", "FUND", "--json"])) as Array<Record<string, unknown>>;
+      expect(iOut).toEqual([
+        {
+          ref: "I-CLI",
+          type: "clawback",
+          account: holder,
+          units: "5",
+          issuedAt: at(4),
+          approvedBy: null,
+          reason: null,
+        },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it("does not let a failed deferred watch in indexing state consume maxAssetsPerOrg", async () => {
+    const h = harness({ maxAssetsPerOrg: 1 });
+    h.chain.baselineResult = undefined;
+    const client = await new Client(h.app).signUp("cap@example.test", "Quota Test");
+    const issuer = key();
+
+    const first = await client.call("/api/assets", {
+      body: { network: "testnet", asset: `BAD:${issuer}` },
+    });
+    expect(first.status).toBe(201);
+    const firstBody = (await first.json()) as { id: string; state: string };
+    expect(firstBody.state).toBe("indexing");
+
+    await vi.waitFor(async () => {
+      const detail = await client.json<{ state: string; syncError?: string }>(`/api/assets/${firstBody.id}`);
+      expect(detail.state).toBe("indexing");
+      expect(detail.syncError).toBeTruthy();
+    });
+
+    const second = await client.call("/api/assets", {
+      body: { network: "testnet", asset: `GOOD:${issuer}`, fromLedger: 1 },
+    });
+    expect(second.status).toBe(201);
+    const secondBody = (await second.json()) as { id: string };
+
+    await vi.waitFor(async () => {
+      const detail = await client.json<{ state: string }>(`/api/assets/${secondBody.id}`);
+      expect(detail.state).toBe("ready");
+    });
+
+    const third = await client.call("/api/assets", {
+      body: { network: "testnet", asset: `THIRD:${issuer}`, fromLedger: 1 },
+    });
+    expect(third.status).toBe(400);
+    expect(await third.text()).toContain("A workspace can watch 1 assets");
   });
 
   it("supports replace mode in importInstructions with counts, parse-issue guard, and controls update", async () => {

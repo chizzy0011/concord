@@ -44,7 +44,9 @@ export async function runCli(
       csv: { type: "string" },
       out: { type: "string" },
       note: { type: "string" },
+      role: { type: "string" },
       limit: { type: "string" },
+      before: { type: "string" },
       json: { type: "boolean" },
       yes: { type: "boolean", short: "y" },
       help: { type: "boolean", short: "h" },
@@ -100,6 +102,17 @@ export async function runCli(
       console.log(`${config.publicUrl}/#/reset/${auth.createResetToken(need(a, "email"))}`);
       console.log("Valid for one day, once. Send it to the account's owner over a channel you trust.");
       break;
+    case "invite": {
+      const org = auth.findOrg(need(a, "workspace"));
+      const email = need(b, "email");
+      if (values.role !== undefined && values.role !== "owner" && values.role !== "member") {
+        throw new Error("--role must be owner or member");
+      }
+      const invite = auth.createInviteAs(org.id, email, values.role ?? "member", actor.label);
+      console.log(`${config.publicUrl}/#/invite/${invite.token}`);
+      console.log("Valid for 7 days, once. Send it to the invited person over a channel you trust.");
+      break;
+    }
     case "org-delete": {
       const org = auth.findOrg(need(a, "workspace"));
       auth.deleteOrg(org.id);
@@ -234,6 +247,49 @@ export async function runCli(
     case "instructions":
       out(workspace().importInstructions(need(a, "asset"), readFileSync(need(b, "file"), "utf8")));
       break;
+    case "journal-list": {
+      const limit = values.limit ? Number(values.limit) : undefined;
+      const rows = workspace().journalEntries(need(a, "asset"), {
+        ...(limit !== undefined ? { limit } : {}),
+        ...(values.before ? { before: values.before } : {}),
+      });
+      if (values.json) {
+        out(rows);
+        break;
+      }
+      table(
+        rows.map((r) => ({
+          ref: r.ref,
+          date: r.date,
+          type: r.type,
+          from: r.from ?? "",
+          to: r.to ?? "",
+          units: r.units,
+          txHash: r.txHash ?? "",
+          status: r.status ?? "",
+        })),
+      );
+      break;
+    }
+    case "instructions-list": {
+      const rows = workspace().instructionList(need(a, "asset"));
+      if (values.json) {
+        out(rows);
+        break;
+      }
+      table(
+        rows.map((r) => ({
+          ref: r.ref,
+          type: r.type,
+          account: r.account,
+          units: r.units ?? "",
+          issuedAt: r.issuedAt,
+          approvedBy: r.approvedBy ?? "",
+          reason: r.reason ?? "",
+        })),
+      );
+      break;
+    }
     case "reconcile":
       printRun(await workspace().reconcile(need(a, "asset"), values.register ? Number(values.register) : undefined, actor));
       break;

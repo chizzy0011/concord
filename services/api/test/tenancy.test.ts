@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync as readFixture } from "node:fs";
-import { Asset, StrKey } from "@stellar/stellar-sdk";
+import { Asset, StrKey, nativeToScVal } from "@stellar/stellar-sdk";
 import { Auth } from "../src/auth.js";
 import { StellarSource } from "../src/chain.js";
 import { Concord } from "../src/concord.js";
@@ -111,6 +111,7 @@ function probes(s: Seeded): Record<string, Probe> {
     "GET /api/assets/:id/reconciliations": p("GET", `/api/assets/${id}/reconciliations`),
     "POST /api/assets/:id/reconciliations": p("POST", `/api/assets/${id}/reconciliations`, { registerId: s.registerId }),
     "GET /api/reconciliations/:id": p("GET", `/api/reconciliations/${s.runId}`),
+    "GET /api/reconciliations/:id/report": p("GET", `/api/reconciliations/${s.runId}/report`),
     "GET /api/assets/:id/actions": p("GET", `/api/assets/${id}/actions`),
     "POST /api/assets/:id/actions": p("POST", `/api/assets/${id}/actions`, { type: "split", recordTime: at(1), num: "2", den: "1" }),
     "GET /api/actions/:id": p("GET", `/api/actions/${s.actionId}`),
@@ -1478,6 +1479,70 @@ describe("chain endpoints", () => {
       }
     },
   );
+  it("baseline() handles an empty first page, fails over on invalid Latest-Ledger headers, and stops after 200 records with no next link", async () => {
+    const issuer = key();
+    const firstPath = `/accounts?asset=FUND%3A${issuer}&limit=200&order=asc`;
+    const h1 = "https://h1.example";
+    const h2 = "https://h2.example";
+    const multiHorizonNet = {
+      name: "mainnet" as const,
+      passphrase: MAINNET_PASSPHRASE,
+      rpc: [{ url: "https://rpc.example" }],
+      horizon: [{ url: h1 }, { url: h2 }],
+    };
+    const record = (id: string, balance: string) => ({
+      account_id: id,
+      balances: [{ asset_code: "FUND", asset_issuer: issuer, balance, is_authorized: true }],
+    });
+
+    // 1. Empty first page returns an empty map at the page's ledger.
+    const empty = scripted({
+      [`https://horizon.example${firstPath}`]: [
+        () => new Response(JSON.stringify({ _links: {}, _embedded: { records: [] } }), { headers: { "latest-ledger": "77" } }),
+      ],
+    });
+    const emptyBaseline = await new StellarSource(network(["https://rpc.example"]), empty.deps).baseline("FUND", issuer, 7);
+    expect(emptyBaseline.ledger).toBe(77);
+    expect(emptyBaseline.openings.size).toBe(0);
+    expect(empty.calls.map((c) => c.url)).toEqual([`https://horizon.example${firstPath}`]);
+
+    // 2. Missing, '0', or 'abc' Latest-Ledger header fails over to the next Horizon endpoint.
+    for (const badHeaders of [{}, { "latest-ledger": "0" }, { "latest-ledger": "abc" }] as Array<Record<string, string>>) {
+      const failoverHolder = key();
+      const failover = scripted({
+        [`${h1}${firstPath}`]: [
+          () => new Response(JSON.stringify({ _links: {}, _embedded: { records: [] } }), { headers: badHeaders }),
+        ],
+        [`${h2}${firstPath}`]: [
+          () =>
+            new Response(
+              JSON.stringify({ _links: {}, _embedded: { records: [record(failoverHolder, "5.0000000")] } }),
+              { headers: { "latest-ledger": "88" } },
+            ),
+        ],
+      });
+      const res = await new StellarSource(multiHorizonNet, failover.deps).baseline("FUND", issuer, 7);
+      expect(res.ledger).toBe(88);
+      expect(res.openings.size).toBe(1);
+      expect(res.openings.get(failoverHolder)).toEqual({ amount: u(5), asOfLedger: 88, authorized: true });
+      expect(failover.calls.map((c) => c.url)).toEqual([`${h1}${firstPath}`, `${h2}${firstPath}`]);
+    }
+
+    // 3. Exactly 200 records with no _links.next stops after one request.
+    const twoHundred = Array.from({ length: 200 }, () => record(key(), "1.0000000"));
+    const singleFull = scripted({
+      [`https://horizon.example${firstPath}`]: [
+        () =>
+          new Response(JSON.stringify({ _links: {}, _embedded: { records: twoHundred } }), {
+            headers: { "latest-ledger": "99" },
+          }),
+      ],
+    });
+    const fullBaseline = await new StellarSource(network(["https://rpc.example"]), singleFull.deps).baseline("FUND", issuer, 7);
+    expect(fullBaseline.ledger).toBe(99);
+    expect(fullBaseline.openings.size).toBe(200);
+    expect(singleFull.calls.map((c) => c.url)).toEqual([`https://horizon.example${firstPath}`]);
+  });
 
   it("finds classic assets by code, most widely held first", async () => {
     const [i1, i2] = [key(), key()];
@@ -1640,6 +1705,155 @@ describe("chain endpoints", () => {
     const head = await source.latestLedger();
     expect(head.latest).toBe(50);
     expect(calls.map((c) => c.url)).toEqual([a, a, b]);
+  });
+
+  it("retries a timed-out request once on the same endpoint with backoff, then fails over to the next endpoint", async () => {
+    const a = "https://a.example/secret-key";
+    const b = "https://b.example";
+    const timeout = () => {
+      throw new DOMException("t", "TimeoutError");
+    };
+    const { calls, clock, deps } = scripted({
+      [a]: [timeout, timeout],
+      [b]: [health],
+    });
+    const sleeps: number[] = [];
+    const trackedDeps = {
+      ...deps,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        await deps.sleep(ms);
+      },
+    };
+    const before = clock.value;
+    const source = new StellarSource(network([a, b]), trackedDeps);
+    expect(await source.latestLedger()).toMatchObject({ latest: 50, oldest: 10 });
+    expect(calls.map((c) => c.url)).toEqual([a, a, b]);
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]!).toBeGreaterThanOrEqual(250);
+    expect(sleeps[0]!).toBeLessThanOrEqual(500);
+    expect(clock.value - before).toBeCloseTo(sleeps[0]!, 6);
+
+    const single = scripted({ [a]: [timeout, timeout] });
+    const allFail = new StellarSource(network([a]), single.deps);
+    const err = await allFail.latestLedger().catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("Stellar RPC (mainnet) is unavailable (a.example: timed out)");
+    expect((err as Error).message).not.toContain("secret-key");
+  });
+
+  it("getEvents maps cursor, latestLedger, latestLedgerCloseTime, missing events, and skips ignored events", async () => {
+    const rpc = "https://rpc.example";
+    const contractId = StrKey.encodeContract(Buffer.alloc(32, 7));
+    const [a, b] = [key(), key()];
+    const sym = (s: string) => nativeToScVal(s, { type: "symbol" }).toXDR("base64");
+    const addr = (s: string) => nativeToScVal(s, { type: "address" }).toXDR("base64");
+    const str = (s: string) => nativeToScVal(s).toXDR("base64");
+    const i128 = (n: bigint) => nativeToScVal(n, { type: "i128" }).toXDR("base64");
+    const rawEvent = (id: string, topic: string[], value: string) => ({
+      id,
+      ledger: 120,
+      ledgerClosedAt: "2026-09-21T14:13:20.000Z",
+      contractId,
+      txHash: `tx-${id}`,
+      topic,
+      value,
+    });
+
+    const eTransfer = rawEvent("001", [sym("transfer"), addr(a), addr(b), str(`FUND:${a}`)], i128(5n));
+    const eApprove = rawEvent("002", [sym("approve"), addr(a), addr(b), str(`FUND:${a}`)], i128(9n));
+    const eMint = rawEvent("003", [sym("mint"), addr(b), str(`FUND:${a}`)], i128(12n));
+
+    const { deps } = scripted({
+      [rpc]: [
+        () =>
+          new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                events: [eTransfer, eApprove, eMint],
+                cursor: "003",
+                latestLedger: 120,
+                latestLedgerCloseTime: "1790000000",
+              },
+            }),
+          ),
+        () =>
+          new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                events: [],
+                latestLedger: 121,
+                latestLedgerCloseTime: "0",
+              },
+            }),
+          ),
+        () =>
+          new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                latestLedger: 122,
+              },
+            }),
+          ),
+      ],
+    });
+    const source = new StellarSource(network([rpc]), deps);
+
+    // 1. Maps 2 tracked events (skipping approve), passes cursor, and converts latestLedgerCloseTime
+    const firstPage = await source.getEvents(contractId, { startLedger: 100 }, 10);
+    expect(firstPage).toEqual({
+      events: [
+        {
+          id: "001",
+          assetId: contractId,
+          kind: "transfer",
+          ledger: 120,
+          closedAt: "2026-09-21T14:13:20.000Z",
+          txHash: "tx-001",
+          amount: 5n,
+          from: a,
+          to: b,
+        },
+        {
+          id: "003",
+          assetId: contractId,
+          kind: "mint",
+          ledger: 120,
+          closedAt: "2026-09-21T14:13:20.000Z",
+          txHash: "tx-003",
+          amount: 12n,
+          to: b,
+        },
+      ],
+      cursor: "003",
+      latestLedger: 120,
+      latestLedgerClosedAt: "2026-09-21T14:13:20.000Z",
+      skipped: 0,
+    });
+
+    // 2. '0' close time and missing cursor omit both keys (strict key equality)
+    const zeroClosePage = await source.getEvents(contractId, { cursor: "003" }, 10);
+    expect(zeroClosePage).toEqual({
+      events: [],
+      latestLedger: 121,
+      skipped: 0,
+    });
+    expect("cursor" in zeroClosePage).toBe(false);
+    expect("latestLedgerClosedAt" in zeroClosePage).toBe(false);
+
+    // 3. Missing events array and missing latestLedgerCloseTime give [] and omit optional keys
+    const missingEventsPage = await source.getEvents(contractId, { startLedger: 122 }, 10);
+    expect(missingEventsPage).toEqual({
+      events: [],
+      latestLedger: 122,
+      skipped: 0,
+    });
   });
 });
 
